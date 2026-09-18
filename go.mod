@@ -1,6 +1,6 @@
 module github.com/couchbaselabs/bucketpool
 
-go 1.24.0
+go 1.27.0
 
 require (
 	github.com/couchbase/gocb/v2 v2.12.4

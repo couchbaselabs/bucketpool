@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/couchbase/gocb/v2"
@@ -33,6 +35,17 @@ const xattrTableOfContents = "$XTOC"
 // readyTimeout is how long to wait for a connection when the caller set no deadline.
 const readyTimeout = 30 * time.Second
 
+// DefaultConcurrency is how many documents a purge removes at once when the caller names no
+// figure.  Purging one document costs one or two key/value round trips, so the round-trip
+// time to the cluster, not the bandwidth it uses, sets how fast a purge runs: a cluster 20ms
+// away serves about one document per worker every 40ms.  The ceiling is the request queue of
+// the client, which holds 2048 requests per node, so this leaves half of it free.
+const DefaultConcurrency = 1024
+
+// maxReportedErrors caps the failures the purge reports.  A deadline that expires mid-purge
+// fails every document that is left, and thousands of identical lines bury the real cause.
+const maxReportedErrors = 10
+
 // bodyPath is the sub-document path of the document body itself.
 const bodyPath = ""
 
@@ -43,6 +56,7 @@ type Options struct {
 	Username         string // the administrator username
 	Password         string // the administrator password
 	Bucket           string // the bucket to empty
+	Concurrency      int    // documents to purge at once; DefaultConcurrency when not positive
 }
 
 // Summary counts what one purge did.
@@ -113,8 +127,16 @@ func Run(ctx context.Context, opts Options) (*Summary, error) {
 		return nil, fmt.Errorf("waiting for bucket %q: %w", opts.Bucket, err)
 	}
 
-	purged, purgeErr := purgeAll(ctx, bucket, collections, events)
+	purged, purgeErr := purgeAll(ctx, bucket, collections, events, opts.concurrency())
 	return &Summary{Processed: len(events), Purged: purged}, purgeErr
+}
+
+// concurrency is how many documents to purge at once.
+func (o Options) concurrency() int {
+	if o.Concurrency > 0 {
+		return o.Concurrency
+	}
+	return DefaultConcurrency
 }
 
 // deadline returns the deadline of ctx, or one readyTimeout from now when ctx has none.
@@ -194,21 +216,36 @@ func collectEvents(ctx context.Context, opts Options) (map[docKey]docEvent, erro
 	}
 
 	obs := &observer{events: make(map[docKey]docEvent)}
-	for vbID := range uint16(numVbuckets) {
-		if highSeqNos[vbID] == 0 {
-			continue
-		}
-		obs.streams.Add(1)
-		if err := openStream(ctx, agent, obs, vbID, highSeqNos[vbID]); err != nil {
-			obs.streams.Done()
-			return nil, fmt.Errorf("opening stream for vbucket %d: %w", vbID, err)
-		}
+	if err := openStreams(ctx, agent, obs, highSeqNos); err != nil {
+		return nil, err
 	}
 
 	if err := obs.wait(ctx); err != nil {
 		return nil, err
 	}
 	return obs.events, obs.err()
+}
+
+// openStreams starts a one-shot stream on every vbucket that holds data.  Opening one stream
+// costs a round trip, and a bucket has a vbucket per stream, so they are opened together.
+func openStreams(ctx context.Context, agent *gocbcore.DCPAgent, obs *observer, highSeqNos []uint64) error {
+	errs := make([]error, len(highSeqNos))
+	var opening sync.WaitGroup
+	for vbID := range uint16(len(highSeqNos)) {
+		if highSeqNos[vbID] == 0 {
+			continue
+		}
+		obs.streams.Add(1)
+		opening.Go(func() {
+			if err := openStream(ctx, agent, obs, vbID, highSeqNos[vbID]); err != nil {
+				// The stream never started, so no End event will count it down.
+				obs.streams.Done()
+				errs[vbID] = fmt.Errorf("opening stream for vbucket %d: %w", vbID, err)
+			}
+		})
+	}
+	opening.Wait()
+	return errors.Join(errs...)
 }
 
 func newDCPAgent(ctx context.Context, opts Options) (*gocbcore.DCPAgent, error) {
@@ -250,8 +287,12 @@ func awaitOp(ctx context.Context, op gocbcore.PendingOp, result chan error) erro
 		return err
 	case <-ctx.Done():
 		op.Cancel()
-		<-result
-		return ctx.Err()
+		// Cancel does not stop an operation that already finished, so the callback decides
+		// whether it did.  Reporting a success as a failure would count a live stream out.
+		if err := <-result; err != nil {
+			return ctx.Err()
+		}
+		return nil
 	}
 }
 
@@ -299,28 +340,86 @@ func openStream(ctx context.Context, agent *gocbcore.DCPAgent, obs *observer, vb
 	return awaitOp(ctx, op, opened)
 }
 
-// purgeAll deletes every document the feed reported, along with all of its xattrs.
-func purgeAll(ctx context.Context, bucket *gocb.Bucket, collections map[uint32]collectionRef, events map[docKey]docEvent) (int, error) {
-	var purged int
-	var errs []error
+// purgeAll deletes every document the feed reported, along with all of its xattrs.  The
+// documents are purged by a pool of workers, because each one waits on the network.
+func purgeAll(ctx context.Context, bucket *gocb.Bucket, collections map[uint32]collectionRef, events map[docKey]docEvent, concurrency int) (int, error) {
+	var report failures
+	todo := make([]docKey, 0, len(events))
 	for key, event := range events {
 		// A deletion with no xattrs is an ordinary tombstone; the server reaps it on its own.
 		if event.deleted && event.xattrsKnown && len(event.xattrs) == 0 {
 			continue
 		}
-		ref, ok := collections[key.collectionID]
-		if !ok {
-			errs = append(errs, fmt.Errorf("document %q is in unknown collection %d", key.id, key.collectionID))
+		if _, known := collections[key.collectionID]; !known {
+			report.add(fmt.Errorf("document %q is in unknown collection %d", key.id, key.collectionID))
 			continue
 		}
-		collection := bucket.Scope(ref.scope).Collection(ref.collection)
-		if err := purgeDocument(ctx, collection, key.id, event); err != nil {
-			errs = append(errs, fmt.Errorf("purging %q from %s.%s: %w", key.id, ref.scope, ref.collection, err))
-			continue
-		}
-		purged++
+		todo = append(todo, key)
 	}
-	return purged, errors.Join(errs...)
+
+	var purged atomic.Int64
+	work := make(chan docKey)
+	var workers sync.WaitGroup
+	for range min(concurrency, len(todo)) {
+		workers.Go(func() {
+			for key := range work {
+				ref := collections[key.collectionID]
+				collection := bucket.Scope(ref.scope).Collection(ref.collection)
+				if err := purgeDocument(ctx, collection, key.id, events[key]); err != nil {
+					report.add(fmt.Errorf("purging %q from %s.%s: %w", key.id, ref.scope, ref.collection, err))
+					continue
+				}
+				purged.Add(1)
+			}
+		})
+	}
+
+	for _, key := range todo {
+		// Every document left fails the same way once the deadline passes, so there is
+		// nothing to learn from handing the rest to the workers.
+		if ctx.Err() != nil {
+			break
+		}
+		work <- key
+	}
+	close(work)
+	workers.Wait()
+
+	done := int(purged.Load())
+	if err := ctx.Err(); err != nil {
+		return done, errors.Join(fmt.Errorf("the purge ran out of time after %d of %d documents: %w",
+			done, len(todo), err), report.err())
+	}
+	return done, report.err()
+}
+
+// failures collects what went wrong, and keeps only the first maxReportedErrors of them.
+type failures struct {
+	mu    sync.Mutex
+	kept  []error
+	total int
+}
+
+func (f *failures) add(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.total++
+	if len(f.kept) < maxReportedErrors {
+		f.kept = append(f.kept, err)
+	}
+}
+
+func (f *failures) err() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.total == 0 {
+		return nil
+	}
+	if f.total == len(f.kept) {
+		return errors.Join(f.kept...)
+	}
+	return fmt.Errorf("%d documents could not be purged, of which the first %d are:\n%w",
+		f.total, len(f.kept), errors.Join(f.kept...))
 }
 
 // purgeDocument removes the body of one document and every xattr it carries.  A full-document

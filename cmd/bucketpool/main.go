@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,9 +25,12 @@ const (
 	envPassword         = "BUCKETPOOL_PASSWORD"
 	envBucket           = "BUCKETPOOL_BUCKET"
 	envTimeout          = "BUCKETPOOL_TIMEOUT"
+	envConcurrency      = "BUCKETPOOL_CONCURRENCY"
 )
 
-const defaultTimeout = 120 * time.Second
+// A purge walks every document the feed reported, so a bucket that holds a lot of live
+// documents takes minutes.  The timeout is there to stop a hung run, not to pace a slow one.
+const defaultTimeout = 30 * time.Minute
 
 const usage = `bucketpool manages Couchbase Server buckets for test suites that reuse them.
 
@@ -93,6 +97,8 @@ func parsePurgeFlags(args []string) (purge.Options, time.Duration) {
 		"bucket to empty ($"+envBucket+")")
 	timeout := fs.Duration("timeout", defaultTimeout,
 		"how long the feed and the purge together are allowed to take ($"+envTimeout+")")
+	concurrency := fs.Int("concurrency", purge.DefaultConcurrency,
+		"how many documents to purge at once ($"+envConcurrency+")")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: bucketpool purge [flags]\n\n"+
 			"Empty a bucket in place, keeping its scopes, collections and indexes.\n"+
@@ -105,8 +111,16 @@ func parsePurgeFlags(args []string) (purge.Options, time.Duration) {
 	_ = fs.Parse(args)
 
 	// The environment is read after parsing, so that an unusable value there cannot defeat a
-	// -timeout flag that the caller passed explicitly.
-	resolved, err := resolveTimeout(flagIsSet(fs, "timeout"), *timeout, os.Getenv(envTimeout), defaultTimeout)
+	// flag that the caller passed explicitly.
+	resolved, err := resolve(envTimeout, flagIsSet(fs, "timeout"), *timeout, os.Getenv(envTimeout),
+		defaultTimeout, time.ParseDuration)
+	if err == nil {
+		*concurrency, err = resolve(envConcurrency, flagIsSet(fs, "concurrency"), *concurrency,
+			os.Getenv(envConcurrency), purge.DefaultConcurrency, strconv.Atoi)
+	}
+	if err == nil && *concurrency < 1 {
+		err = fmt.Errorf("the concurrency must be at least one worker, not %d", *concurrency)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bucketpool: %v\n", err)
 		os.Exit(2)
@@ -118,6 +132,7 @@ func parsePurgeFlags(args []string) (purge.Options, time.Duration) {
 		Username:         *username,
 		Password:         os.Getenv(envPassword),
 		Bucket:           *bucket,
+		Concurrency:      *concurrency,
 	}
 
 	var missing []string
@@ -152,19 +167,19 @@ func flagIsSet(fs *flag.FlagSet, name string) bool {
 	return set
 }
 
-// resolveTimeout picks the timeout to use.  The flag wins, and the environment variable is
-// read, and checked, only when the flag is absent.  An unusable value there is an error the
-// caller must see, rather than a silent default.
-func resolveTimeout(flagSet bool, flagValue time.Duration, raw string, fallback time.Duration) (time.Duration, error) {
+// resolve picks the value of one setting.  The flag wins, and the environment variable named
+// by env is read, and checked, only when the flag is absent.  An unusable value there is an
+// error the caller must see, rather than a silent default.
+func resolve[T any](env string, flagSet bool, flagValue T, raw string, fallback T, parse func(string) (T, error)) (T, error) {
 	if flagSet {
 		return flagValue, nil
 	}
 	if raw == "" {
 		return fallback, nil
 	}
-	parsed, err := time.ParseDuration(raw)
+	parsed, err := parse(raw)
 	if err != nil {
-		return 0, fmt.Errorf("$%s is not a duration: %w", envTimeout, err)
+		return fallback, fmt.Errorf("$%s is unusable: %w", env, err)
 	}
 	return parsed, nil
 }

@@ -7,12 +7,6 @@ and its indexes stay exactly as they are.
 Inspired by the in-process bucket pool in <https://github.com/couchbase/sync_gateway>, this is
 used by <https://github.com/couchbaselabs/couchbase-lite-tests> for mobile testing.
 
-A test suite that needs an empty bucket usually drops the bucket and creates a new one. Over time, dropping and recreating buckets becomes increasingly slow in both kv and index services.
-
-Sync Gateway tracks tombstones as part of normal behavior for deleted mobile documents with a _sync xattr.
-
-Use a one-shot DCP feed to find all documents and purge them.
-
 Sync Gateway does not care about:
 
 1. tombstones with no xattrs
@@ -68,7 +62,8 @@ bucketpool purge
 | `--username`          | `BUCKETPOOL_USERNAME`          | yes      | The administrator username                                                    |
 | _(none)_              | `BUCKETPOOL_PASSWORD`          | yes      | The administrator password                                                    |
 | `--bucket`            | `BUCKETPOOL_BUCKET`            | yes      | The bucket to empty                                                           |
-| `--timeout`           | `BUCKETPOOL_TIMEOUT`           | no       | How long the feed and the purge together are allowed to take (default `120s`) |
+| `--timeout`           | `BUCKETPOOL_TIMEOUT`           | no       | How long the feed and the purge together are allowed to take (default `30m`)  |
+| `--concurrency`       | `BUCKETPOOL_CONCURRENCY`       | no       | How many documents to purge at once (default `1024`)                          |
 
 The password has no flag, so that it stays out of the process list.
 
@@ -84,7 +79,13 @@ number it purged:
 
 If the purge never starts, the command prints nothing on standard output and exits
 non-zero. If it starts and some documents fail, it prints the summary, reports the
-failures on standard error, and still exits non-zero.
+failures on standard error, and still exits non-zero. The report names at most ten
+documents, and gives the total count when more than ten failed.
+
+Purging one document costs one or two network round trips, so the distance to the cluster,
+not the bandwidth, sets the rate. Raise `--concurrency` when the round trip is the limit.
+The gain flattens out below 512 against a single node on localhost, and the request queue of
+the client holds 2048 requests per node.
 
 ## Develop
 
@@ -95,4 +96,5 @@ go test ./...
 ```
 
 The tests cover the parts that need no cluster: xattr parsing, the feed observer, the
-sub-document batching, and the flag handling. Everything else needs a live Couchbase Server.
+sub-document batching, the failure report, and the flag handling. Everything else needs a
+live Couchbase Server.
